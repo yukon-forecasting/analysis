@@ -1,0 +1,146 @@
+---
+title: AMATC Differences
+author: Bryce Mecum
+output: github_document
+---
+
+# Do minor differences in AMATC matter?
+
+For our forecast work, we keep a primary data sheet with all of the environmental (AMATC, MSSTC, PICE) and run timing (FIFDJ, QDJ, MDJ) data. This data sheet is updated every year as new data comes in. When I was handed this project, the data sheet was given to me with no provenance information and I've always wanted to compare what we have in our main data sheet with what's available from NOAA.
+
+This notebook answers that question just for AMATC. In the future, we can look at MSSTC and PICE.
+
+## Strategy
+
+Use the `rnoaa` package to grab "Global Summary of the Month" data from the NOAA API for the Nome Airport, compare those values with what the main data sheet has, and then perform a what-if analysis to see how sensitive the forecast is to any discrepancies.
+
+## Setup
+
+### Packages
+
+```{r}
+library(rnoaa)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+
+### NOAA API Key
+
+```{r}
+options(noaakey = Sys.getenv("NOAA_KEY"))
+```
+
+## Step 1: Get April mean air temps from 1961 to 2021
+
+```{r}
+get_nome_gsom_april <- function(year) {
+  datasets_gsom <- ncdc(datasetid = "GSOM",
+                        datatypeid = "TAVG", 
+                        stationid = "GHCND:USW00026617",
+                        startdate = paste0(year, "-04-01"),
+                        enddate = paste0(year, "-04-30"))
+  datasets_gsom$data$value
+}
+```
+
+```{r, cache=TRUE}
+result <- lapply(1961:2021, function(y) {
+  Sys.sleep(0.1) # Be nice-ish
+  data.frame(year = y, amatc_gsom = get_nome_gsom_april(y))
+})
+
+gsom_amatc <- do.call(rbind, result)
+```
+
+## Step 2: Grab the main data sheet and compare the values
+
+Here I grab the main data sheet from last years' GitHub repo, bring it into R and calculate differences between the two series.
+
+```{r}
+url <- "https://raw.githubusercontent.com/amoeba/2020-yukon-forecasting/master/data/yukon.csv"
+yukon_data <- read_csv(url) %>% 
+    left_join(gsom_amatc, by = "year") %>% 
+    mutate(diff = amatc - amatc_gsom,
+           diff_absolute = abs(amatc - amatc_gsom))
+    
+```
+
+Let's take a look at a ranked table of the absolute differences.
+
+```{r}
+yukon_data %>% arrange(desc(diff_absolute))
+```
+
+These differences are very small relative to the magnitude of the values. The worst is just over half a degree C differnce which is a pretty big difference but the vast majority are <= 0.05C different. _Note that you'd normally convert to Kelvin to compare temperatures but we actually don't care about that because we're running linear models here and the absolute differences in the values are all we care about._
+
+```{r}
+summary(yukon_data$diff_absolute)
+```
+
+### Visualize
+
+I always like to take a look graphically to get a feel for the data so let's do that.
+
+```{r}
+yukon_aironly <- yukon_data %>% 
+    select(year, amatc, amatc_gsom)  %>% 
+    pivot_longer(-year)
+```
+
+```{r differences}
+options(repr.plot.width=10, repr.plot.height=4)
+ggplot(yukon_aironly) +
+    geom_line(aes(year, value, color = name), alpha = 1) +
+    scale_colour_manual(values = c("black", "red")) +
+    theme_classic()
+```
+
+The table above, plus this graph, makes it look like the differences are very minor. That's good. You can see 2013 stick out there pretty prominently though.
+
+## Does it make a substantial difference to the forecasts?
+
+While it's useful to see the differences and gratifying to know they're small, the most important question is whether the differences _mean_ anything when it comes to the forecasts themselves. Let's take a look by running hindcasts (forecasts of previous years) for MDJ (the 50% point).
+
+First we make a function to help us generate forecasts in bulk:
+
+```{r}
+get_mdj_forecast <- function(data, forecast_years, formula) {
+    do_one <- function(forecast_year) {
+        data_subset <- subset(data, year %in% seq(min(data$year), forecast_year - 1))
+        mod <- lm(formula, data = data_subset)
+        floor(predict(mod, yukon_data[which(yukon_data$year == forecast_year),]))
+    }
+    
+    vapply(forecast_years, do_one, 0)
+}
+```
+
+```{r}
+(before <- get_mdj_forecast(yukon_data, 1980:2020, mdj ~ amatc + msstc + pice))
+(after <- get_mdj_forecast(yukon_data, 1980:2020, mdj ~ amatc_gsom + msstc + pice))
+```
+
+```{r}
+after - before
+```
+
+Zeroes across the board. That's interesting. Good, if it's true.
+
+## Verify
+
+While I did think that the difference in forecasts would be small, I still want to check to make sure the above result makes sense. The forecasted value for MDJ would be expected to change if the differnce in AMATC values between the main data sheet and the published GSOM values is great enough _relative to the estimate for the coefficient in the model_. Let's look at that for each model to get an idea of the coefficient estimates.
+
+```{r}
+current_model <- lm(mdj ~ amatc + msstc + pice, yukon_data)
+summary(current_model)
+```
+
+```{r}
+gsom_model <- lm(mdj ~ amatc_gsom + msstc + pice, yukon_data)
+summary(gsom_model)
+```
+
+This looks like, in either scenario, the coefficient estimate for AMATC is ~-0.3. That can be interpreted as: For every 1 degree C change in AMATC, the forecasted value for MDJ would be expected to change by ~0.3. Since none of our differences between the AMATC values in the main data sheet and the published NOAA GSOM values was even greater than 0.57, we wouldn't expect many predictions to change anyway.
+
